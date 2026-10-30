@@ -1,10 +1,11 @@
-import React, { useContext, useState, useEffect, useCallback, useRef, type MutableRefObject } from 'react'
+import React, { useContext, useState, useEffect, useCallback, useRef } from 'react'
 import { useAccount, useReadContracts, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
-import { createPublicClient, http, parseGwei, decodeEventLog, keccak256, toBytes } from 'viem'
+import { parseGwei } from 'viem'
 import { toast } from 'sonner'
 import { NetworkContext } from '../App'
 import { NETWORKS } from '../config/networks'
 import { VESTING_ABI } from '../lib/abi'
+import { scanTimeline, collapseTranches, type ScanPhase, type TimelineEvent } from '../lib/timelineScan'
 import {
   formatNativeUsdc, exactNativeUsdc, formatTs, statusFromCode,
   computeVestedAt, decodeContractError,
@@ -12,27 +13,9 @@ import {
 } from '../lib/vesting'
 import { StatusBadge } from '../components/StatusBadge'
 import { VestingChart } from '../components/VestingChart'
-import { scanLogsSequential, readScanCache, writeScanCache, isRateLimitError } from '../lib/logscan'
 import { ExternalLink, RefreshCw, AlertTriangle } from 'lucide-react'
 
 const MIN_GAS_PRICE = parseGwei('20')
-
-// Precompute topic0 for each event so we can dispatch by topic0 rather than trying all 3
-const TOPIC0: Record<string, 'ScheduleCreated' | 'Claimed' | 'Cancelled' | 'TrancheAdded'> = {
-  [keccak256(toBytes('ScheduleCreated(uint256,address,address,uint8,uint128,uint64,uint64,uint64,bool)'))]: 'ScheduleCreated',
-  [keccak256(toBytes('Claimed(uint256,address,uint256,uint256,address)'))]: 'Claimed',
-  [keccak256(toBytes('Cancelled(uint256,address,address,uint256,uint256)'))]: 'Cancelled',
-  [keccak256(toBytes('TrancheAdded(uint256,uint256,uint64,uint128)'))]: 'TrancheAdded',
-}
-
-interface TimelineEvent {
-  type: 'ScheduleCreated' | 'Claimed' | 'Cancelled' | 'TrancheAdded'
-  txHash: string
-  logIndex: number
-  blockNumber: bigint
-  blockTime?: number // unix seconds, set from getBlock when available
-  args: Record<string, unknown>
-}
 
 // All hooks live at top level. Early returns happen after all hooks are called.
 export function SchedulePage({ id }: { id: string }) {
@@ -68,155 +51,79 @@ export function SchedulePage({ id }: { id: string }) {
     return () => clearInterval(t)
   }, [])
 
-  // Timeline state — single dispatch to avoid set-state-in-effect per state var
-  type TLState = { events: TimelineEvent[]; loading: boolean; error: boolean }
+  // Timeline state: events stay visible while later chunks load or a retry runs
+  type TLState = {
+    events: TimelineEvent[]
+    loading: boolean // nothing to show yet
+    scanning: boolean
+    progress: { phase: ScanPhase; pct: number } | null
+    error: boolean
+  }
   type TLAction =
-    | { type: 'start' }
-    | { type: 'done'; events: TimelineEvent[]; error: boolean }
+    | { type: 'start'; reset: boolean }
+    | { type: 'update'; events: TimelineEvent[]; phase: ScanPhase; pct: number }
+    | { type: 'done' }
     | { type: 'fail' }
   const [tlState, dispatchTl] = React.useReducer(
     (s: TLState, a: TLAction): TLState => {
-      if (a.type === 'start') return { events: s.events, loading: true, error: false }
-      if (a.type === 'done') return { events: a.events, loading: false, error: a.error }
-      return { events: s.events, loading: false, error: true }
+      switch (a.type) {
+        case 'start': {
+          const events = a.reset ? [] : s.events
+          return { events, loading: events.length === 0, scanning: true, progress: null, error: false }
+        }
+        case 'update': {
+          const events = collapseTranches(a.events)
+          return {
+            events,
+            loading: events.length === 0,
+            scanning: true,
+            progress: events.length > 0 && a.phase !== 'window' ? { phase: a.phase, pct: a.pct } : null,
+            error: false,
+          }
+        }
+        case 'done':
+          return { ...s, loading: false, scanning: false, progress: null, error: false }
+        default:
+          return { ...s, loading: false, scanning: false, progress: null, error: true }
+      }
     },
-    { events: [], loading: false, error: false }
+    { events: [], loading: false, scanning: false, progress: null, error: false }
   )
   const timeline = tlState.events
   const timelineLoading = tlState.loading
   const timelineError = tlState.error
+  const timelineProgress = tlState.progress
 
-  // Pure fetch — returns data, never touches state.
-  // Sequential 9k-block scan with retry/backoff (see ../lib/logscan) + incremental
-  // localStorage cache, so reloads only scan the new tail. `incomplete` is true when a
-  // chunk still failed after retries (the caller shows an "Incomplete · Retry" badge
-  // instead of silently blanking the timeline).
-  const doFetchTimeline = useCallback(async (): Promise<{ events: TimelineEvent[]; incomplete: boolean }> => {
-    if (!isValidId) return { events: [], incomplete: false }
-    const client = createPublicClient({
-      chain: cfg.chain,
-      transport: http(cfg.chain.rpcUrls.default.http[0]),
-    })
-    const cacheKey = `vesting:${cfg.chain.id}:${cfg.address.toLowerCase()}:${scheduleId.toString()}`
-
-    // raw (pre-collapse) events, oldest-first, carried across reloads via the cache
-    const collapse = (events: TimelineEvent[]): TimelineEvent[] => {
-      const out: TimelineEvent[] = []
-      for (let i = 0; i < events.length; i++) {
-        if (events[i].type === 'TrancheAdded') {
-          let count = 1
-          while (i + count < events.length && events[i + count].type === 'TrancheAdded') count++
-          out.push({
-            type: 'TrancheAdded',
-            txHash: events[i].txHash,
-            logIndex: events[i].logIndex,
-            blockNumber: events[i].blockNumber,
-            blockTime: events[i].blockTime,
-            args: { count },
-          })
-          i += count - 1
-        } else {
-          out.push(events[i])
-        }
-      }
-      return out
-    }
-
-    const cached = readScanCache<TimelineEvent>(cacheKey)
-    const raw: TimelineEvent[] = cached ? [...cached.items] : []
-    const seen = new Set<string>(raw.map((e) => `${e.txHash}-${e.logIndex}`))
-
-    try {
-      const head = await client.getBlockNumber()
-      const haveCache = !!cached && cached.lastScanned >= cfg.deploymentBlock - 1n
-      const fromBlock = haveCache ? cached!.lastScanned + 1n : cfg.deploymentBlock
-
-      let incomplete = false
-      let coveredThrough = haveCache ? cached!.lastScanned : cfg.deploymentBlock - 1n
-
-      if (fromBlock <= head) {
-        const { logs, complete, lastScanned } = await scanLogsSequential(
-          client, fromBlock, head, { address: cfg.address },
-        )
-        coveredThrough = complete ? head : lastScanned
-        incomplete = !complete
-        for (const log of logs) {
-          const topic0 = log.topics[0]
-          if (!topic0) continue
-          const eventName = TOPIC0[topic0]
-          if (!eventName) continue
-          try {
-            const dec = decodeEventLog({
-              abi: VESTING_ABI,
-              data: log.data as `0x${string}`,
-              topics: log.topics as unknown as [`0x${string}`, ...`0x${string}`[]],
-              eventName,
-            })
-            if (!dec?.args) continue
-            const args = dec.args as Record<string, unknown>
-            if (args['id'] !== scheduleId) continue
-            const key = `${log.transactionHash ?? ''}-${log.logIndex ?? 0}`
-            if (seen.has(key)) continue
-            seen.add(key)
-            raw.push({
-              type: eventName,
-              txHash: log.transactionHash ?? '',
-              logIndex: log.logIndex ?? 0,
-              blockNumber: log.blockNumber ?? 0n,
-              args,
-            })
-          } catch {
-            // malformed log — skip
-          }
-        }
-      }
-
-      // Sort by block then logIndex
-      raw.sort((a, b) => {
-        if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1
-        return a.logIndex - b.logIndex
-      })
-
-      // Fetch block timestamps SEQUENTIALLY for blocks we don't already have cached
-      // (parallel getBlock bursts hit the same -32005 limit). Best-effort.
-      const needTimes = [...new Set(raw.filter((e) => e.blockTime === undefined).map((e) => e.blockNumber))]
-      const blockTimes = new Map<bigint, number>()
-      for (const bn of needTimes) {
-        try {
-          const blk = await client.getBlock({ blockNumber: bn })
-          blockTimes.set(bn, Number(blk.timestamp))
-        } catch (e) {
-          if (isRateLimitError(e)) { incomplete = true; break }
-        }
-      }
-      for (const e of raw) {
-        if (e.blockTime === undefined) {
-          const t = blockTimes.get(e.blockNumber)
-          if (t !== undefined) e.blockTime = t
-        }
-      }
-
-      // Persist the raw (uncollapsed) events so the next load only scans the new tail.
-      writeScanCache(cacheKey, coveredThrough, raw)
-
-      return { events: collapse(raw), incomplete }
-    } catch {
-      // Hard failure (e.g. head fetch). Show whatever the cache had, flag incomplete.
-      return { events: collapse(raw), incomplete: true }
-    }
-  }, [cfg, scheduleId, isValidId])
-
-  // Trigger load; single dispatch for each outcome
-  const fetchTimeline = useCallback(() => {
-    dispatchTl({ type: 'start' })
-    doFetchTimeline().then(({ events, incomplete }) => {
-      dispatchTl({ type: 'done', events, error: incomplete })
+  // Scan runs are cancelled when the schedule or network changes, or a new run starts
+  const scanAbortRef = useRef<AbortController | null>(null)
+  const runTimeline = useCallback((reset: boolean) => {
+    scanAbortRef.current?.abort()
+    if (!isValidId) return
+    const ctrl = new AbortController()
+    scanAbortRef.current = ctrl
+    dispatchTl({ type: 'start', reset })
+    scanTimeline({
+      network,
+      cfg,
+      scheduleId,
+      signal: ctrl.signal,
+      onUpdate: (u) => dispatchTl({ type: 'update', events: u.events, phase: u.phase, pct: u.progress }),
+    }).then((result) => {
+      if (result === 'done') dispatchTl({ type: 'done' })
+      else if (result === 'error') dispatchTl({ type: 'fail' })
     }).catch(() => {
-      dispatchTl({ type: 'fail' })
+      if (!ctrl.signal.aborted) dispatchTl({ type: 'fail' })
     })
-  }, [doFetchTimeline])
+  }, [network, cfg, scheduleId, isValidId])
 
-  useEffect(fetchTimeline, [fetchTimeline])
+  // Retry / refresh keep the events already shown
+  const fetchTimeline = useCallback(() => runTimeline(false), [runTimeline])
+
+  useEffect(() => {
+    runTimeline(true)
+    return () => scanAbortRef.current?.abort()
+  }, [runTimeline])
+
 
   // Tx hooks
   const { writeContractAsync, isPending } = useWriteContract()
@@ -348,7 +255,7 @@ export function SchedulePage({ id }: { id: string }) {
           onClick={() => { void refetch(); void fetchTimeline() }}
           className="w-9 h-9 flex items-center justify-center rounded-btn text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors"
         >
-          <RefreshCw size={15} className={timelineLoading ? 'animate-spin' : ''} />
+          <RefreshCw size={15} className={tlState.scanning ? 'animate-spin' : ''} />
         </button>
       </div>
 
@@ -591,6 +498,11 @@ export function SchedulePage({ id }: { id: string }) {
               )
             })}
           </div>
+        )}
+        {timelineProgress && (
+          <p className="text-[11px] text-text-muted mt-3">
+            {timelineProgress.phase === 'tail' ? 'Checking newer blocks…' : 'Scanning events…'} {timelineProgress.pct}%
+          </p>
         )}
         {timelineError && !timelineLoading && (
           <p className="text-xs text-text-muted mt-2">Timeline may be incomplete. Some events could not be loaded.</p>
