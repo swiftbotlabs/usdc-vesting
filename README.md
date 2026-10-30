@@ -99,11 +99,15 @@ Output goes to `dist/`. The app is configured for sub-path serving (`base: './'`
 | 4 | Claims the rest after the end (completed) | 0.031667 | [0xefe30989…a5f](https://explorer.arc.io/tx/0xefe30989e1697552e6abf39ac2bd2571a809f0eec956937b00d5c47953f85a5f) |
 
 **How it was built.** One Arc Studio project (https://studio.arc.io/app/1a3a084e-f255-4435-985a-7be76f606025), driven
-through the Arc Studio CLI in 4 turns: (1) smart-contract pipeline: contract, Foundry suite, two auditors (stack-too-deep fix;
+through the Arc Studio CLI in 5 turns: (1) smart-contract pipeline: contract, Foundry suite, two auditors (stack-too-deep fix;
 blocklisted-beneficiary limitation), cut off by the daily limit; (2) the pipeline continued: Slither, 76 tests passing (71 unit/fuzz
 + 5 invariants, 256 runs x 128,000 calls), Arc Testnet deploy, ABI; (3) the app; (4) one fix turn with 16 findings from our
-end-to-end test. We re-ran the tests locally, deployed the byte-identical bytecode to Arc mainnet (our deploy script refuses
-otherwise) and ran the demos. No contract or app code was edited by hand.
+end-to-end test; (5) a fix turn on Oct 30: the schedule Timeline now reads each schedule only inside its known block window
+(verified with a full log scan up to block 28663171, kept in `src/config/networks.ts`) plus the newer blocks, one call at a time
+with retry and a local cache, so it loads in seconds instead of scanning ~200 chunks from the deployment block (the Studio-written
+notes above about scanning from the deployment block describe the earlier version). We re-ran the tests locally, deployed the
+byte-identical bytecode to Arc mainnet (our deploy script refuses otherwise) and ran the demos. Contract and app code in this repo
+are exactly as Studio wrote them: a hand-written Timeline patch we pushed on Oct 21 was replaced by Studio's turn 5 on Oct 30.
 
 **Hosting.** Arc Studio does not export `dist/`, so `.github/workflows/pages.yml` (ours) installs from Studio's `bun.lock` and runs
 `vite build` on this source; GitHub Pages serves the result. `package.json` has no `build` script: use `bunx vite build` locally.
