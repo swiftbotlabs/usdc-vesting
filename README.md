@@ -6,7 +6,7 @@
 
 A non-custodial USDC vesting app built on Arc. Create linear vesting schedules (with optional cliff) or dated tranche payouts. The smart contract holds custody; anyone can trigger a payout, but funds always go to the registered beneficiary.
 
-Live app: **https://swiftbotlab.github.io/usdc-vesting/**
+Live app: **https://apps.swiftbotlab.workers.dev/usdc-vesting/**
 
 ---
 
@@ -66,7 +66,7 @@ Open [http://localhost:5173](http://localhost:5173).
 bun run build
 ```
 
-Output goes to `dist/`. The app is configured for sub-path serving (`base: './'`) and uses hash routing, so it works from any path (e.g. `swiftbotlab.github.io/usdc-vesting/`).
+Output goes to `dist/`. The app is configured for sub-path serving (`base: './'`) and uses hash routing, so it works from any path (e.g. `apps.swiftbotlab.workers.dev/usdc-vesting/`).
 
 ## Stack
 
@@ -112,6 +112,6 @@ are exactly as Studio wrote them: a hand-written Timeline patch we pushed on Oct
 **Hosting.** Arc Studio does not export `dist/`, so `.github/workflows/pages.yml` (ours) installs from Studio's `bun.lock` and runs
 `vite build` on this source; GitHub Pages serves the result. `package.json` has no `build` script: use `bunx vite build` locally.
 
-**Video walkthrough:** https://github.com/swiftbotlab/usdc-vesting/releases/download/v1.0.0/usdc-vesting-arc-studio-mainnet.mp4
+**Video walkthrough:** https://github.com/swiftbotlabs/usdc-vesting/releases/download/v1.0.0/usdc-vesting-arc-studio-mainnet.mp4
 
 Hand-added files: `.github/workflows/pages.yml`, `SECURITY.md`, `LICENSE`, `logo.png`, and this section.
